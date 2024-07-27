@@ -2,10 +2,12 @@ import time
 from typing import (AsyncGenerator, AsyncIterator, Callable, Dict, List,
                     Optional)
 from typing import Sequence as GenericSequence
-from typing import Tuple, cast
+from typing import Tuple, cast, Union
+import io, base64
 
 from fastapi import Request
 from transformers import PreTrainedTokenizer
+import torch
 
 from vllm.config import ModelConfig
 from vllm.engine.async_llm_engine import AsyncLLMEngine
@@ -107,15 +109,16 @@ class OpenAIServingCompletion(OpenAIServing):
                 sampling_params.logits_processors.append(
                     guided_decode_logit_processor)
 
-            prompts = list(
-                self._tokenize_prompt_input_or_inputs(
-                    request,
-                    tokenizer,
-                    request.prompt,
-                    truncate_prompt_tokens=sampling_params.
-                    truncate_prompt_tokens,
-                    add_special_tokens=request.add_special_tokens,
-                ))
+            prompts: List[Dict[str, Union[
+                str, List[int], torch.Tensor]]] = list(
+                    self._tokenize_prompt_input_or_inputs(
+                        request,
+                        tokenizer,
+                        request.prompt,
+                        truncate_prompt_tokens=sampling_params.
+                        truncate_prompt_tokens,
+                        add_special_tokens=request.add_special_tokens,
+                    )) + self._load_prompt_embdes(request.prompt_embeds)
 
             for i, prompt_inputs in enumerate(prompts):
                 request_id_item = f"{request_id}-{i}"
@@ -135,7 +138,11 @@ class OpenAIServingCompletion(OpenAIServing):
                     log_tracing_disabled_warning()
 
                 generator = self.engine.generate(
-                    {"prompt_token_ids": prompt_inputs["prompt_token_ids"]},
+                    {
+                        "prompt_token_ids":
+                        prompt_inputs.get("prompt_token_ids"),
+                        "prompt_embeds": prompt_inputs.get("prompt_embeds")
+                    },
                     sampling_params,
                     request_id_item,
                     lora_request=lora_request,
@@ -186,7 +193,7 @@ class OpenAIServingCompletion(OpenAIServing):
                 # We did not pass it into vLLM engine to avoid being redundant
                 # with the inputs token IDs
                 if final_res.prompt is None:
-                    final_res.prompt = prompts[i]["prompt"]
+                    final_res.prompt = prompts[i].get("prompt")
 
             final_res_batch_checked = cast(List[RequestOutput],
                                            final_res_batch)

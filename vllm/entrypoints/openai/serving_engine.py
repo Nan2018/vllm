@@ -1,12 +1,13 @@
 import json
-import pathlib
+import pathlib, io, base64
 from dataclasses import dataclass
 from http import HTTPStatus
-from typing import Iterable, Iterator, List, Optional, Tuple, TypedDict, Union
+from typing import Iterable, Iterator, List, Optional, Tuple, TypedDict, Union, Dict, cast
 
 from pydantic import Field
 from transformers import PreTrainedTokenizer, PreTrainedTokenizerFast
 from typing_extensions import Annotated
+import torch
 
 from vllm.config import ModelConfig
 from vllm.engine.async_llm_engine import AsyncLLMEngine
@@ -55,6 +56,10 @@ AnyTokenizer = Union[PreTrainedTokenizer, PreTrainedTokenizerFast]
 class TextTokensPrompt(TypedDict):
     prompt: str
     prompt_token_ids: List[int]
+
+
+class EmbedsPrompt(TypedDict):
+    prompt_embeds: torch.Tensor
 
 
 class OpenAIServing:
@@ -353,23 +358,51 @@ class OpenAIServing:
                     truncate_prompt_tokens=truncate_prompt_tokens,
                 )
 
+    def _load_prompt_embdes(
+        self,
+        prompt_embeds: Optional[Union[str, List[str]]],
+        truncate_prompt_tokens: Optional[Annotated[int, Field(ge=1)]] = None
+    ) -> List[EmbedsPrompt]:
+
+        def _load_and_validate_embed(embed: str) -> EmbedsPrompt:
+            tensor = torch.load(io.BytesIO(base64.b64decode(embed)))
+            assert isinstance(
+                tensor,
+                (torch.FloatTensor, torch.BFloat16Tensor, torch.HalfTensor))
+            if tensor.dim() > 2:
+                tensor = tensor.squeeze(0)
+                assert tensor.dim() == 2
+            if truncate_prompt_tokens is not None:
+                tensor = tensor[-truncate_prompt_tokens:]
+            return {"prompt_embeds": tensor}
+
+        if prompt_embeds:
+            if isinstance(prompt_embeds, list):
+                return [
+                    _load_and_validate_embed(embed) for embed in prompt_embeds
+                ]
+            else:
+                return [_load_and_validate_embed(prompt_embeds)]
+        else:
+            return []
+
     def _log_inputs(
         self,
         request_id: str,
-        inputs: Union[str, List[int], TextTokensPrompt],
+        inputs: Union[str, List[int], TextTokensPrompt, EmbedsPrompt],
         params: Optional[Union[SamplingParams, PoolingParams]],
         lora_request: Optional[LoRARequest],
         prompt_adapter_request: Optional[PromptAdapterRequest],
     ) -> None:
         if self.request_logger is None:
             return
-
+        prompt, prompt_token_ids, prompt_embeds = None, None, None
         if isinstance(inputs, str):
             prompt = inputs
-            prompt_token_ids = None
         elif isinstance(inputs, list):
-            prompt = None
             prompt_token_ids = inputs
+        elif 'prompt_embeds' in inputs:
+            prompt_embeds = inputs.get("prompt_embeds")
         else:
             prompt = inputs["prompt"]
             prompt_token_ids = inputs["prompt_token_ids"]
@@ -378,6 +411,7 @@ class OpenAIServing:
             request_id,
             prompt,
             prompt_token_ids,
+            prompt_embeds,
             params=params,
             lora_request=lora_request,
             prompt_adapter_request=prompt_adapter_request,
